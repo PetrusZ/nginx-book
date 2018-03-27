@@ -17,7 +17,7 @@ nginx在启动后，在unix系统中会以daemon的方式在后台运行，后�
 
 在nginx启动后，如果我们要操作nginx，要怎么做呢？从上文中我们可以看到，master来管理worker进程，所以我们只需要与master进程通信就行了。master进程会接收来自外界发来的信号，再根据信号做不同的事情。所以我们要控制nginx，只需要通过kill向master进程发送信号就行了。比如kill -HUP pid，则是告诉nginx，从容地重启nginx，我们一般用这个信号来重启nginx，或重新加载配置，因为是从容地重启，因此服务是不中断的。master进程在接收到HUP信号后是怎么做的呢？首先master进程在接到信号后，会先重新加载配置文件，然后再启动新的worker进程，并向所有老的worker进程发送信号，告诉他们可以光荣退休了。新的worker在启动后，就开始接收新的请求，而老的worker在收到来自master的信号后，就不再接收新的请求，并且在当前进程中的所有未处理完的请求处理完成后，再退出。当然，直接给master进程发送信号，这是比较老的操作方式，nginx在0.8版本之后，引入了一系列命令行参数，来方便我们管理。比如，./nginx -s reload，就是来重启nginx，./nginx -s stop，就是来停止nginx的运行。如何做到的呢？我们还是拿reload来说，我们看到，执行命令时，我们是启动一个新的nginx进程，而新的nginx进程在解析到reload参数后，就知道我们的目的是控制nginx来重新加载配置文件了，它会向master进程发送信号，然后接下来的动作，就和我们直接向master进程发送信号一样了。
 
-现在，我们知道了当我们在操作nginx的时候，nginx内部做了些什么事情，那么，worker进程又是如何处理请求的呢？我们前面有提到，worker进程之间是平等的，每个进程，处理请求的机会也是一样的。当我们提供80端口的http服务时，一个连接请求过来，每个进程都有可能处理这个连接，怎么做到的呢？首先，每个worker进程都是从master进程fork过来，在master进程里面，先建立好需要listen的socket之后，然后再fork出多个worker进程，这样每个worker进程都可以去accept这个socket(当然不是同一个socket，只是每个进程的这个socket会监控在同一个ip地址与端口，这个在网络协议里面是允许的)。一般来说，当一个连接进来后，所有在accept在这个socket上面的进程，都会收到通知，而只有一个进程可以accept这个连接，其它的则accept失败，这是所谓的惊群现象。当然，nginx也不会视而不见，所以nginx提供了一个accept_mutex这个东西，从名字上，我们可以看这是一个加在accept上的一把共享锁。有了这把锁之后，同一时刻，就只会有一个进程在accpet连接，这样就不会有惊群问题了。accept_mutex是一个可控选项，我们可以显式地关掉，默认是打开的。当一个worker进程在accept这个连接之后，就开始读取请求，解析请求，处理请求，产生数据后，再返回给客户端，最后才断开连接，这样一个完整的请求就是这样的了。我们可以看到，一个请求，完全由worker进程来处理，而且只在一个worker进程中处理。
+现在，我们知道了当我们在操作nginx的时候，nginx内部做了些什么事情，那么，worker进程又是如何处理请求的呢？我们前面有提到，worker进程之间是平等的，每个进程，处理请求的机会也是一样的。当我们提供80端口的http服务时，一个连接请求过来，每个进程都有可能处理这个连接，怎么做到的呢？首先，每个worker进程都是从master进程fork过来，在master进程里面，先建立好需要listen的socket（listenfd）之后，然后再fork出多个worker进程。所有worker进程的listenfd会在新连接到来时变得可读，为保证只有一个进程处理该连接，所有worker进程在注册listenfd读事件前抢accept_mutex，抢到互斥锁的那个进程注册listenfd读事件，在读事件里调用accept接受该连接。当一个worker进程在accept这个连接之后，就开始读取请求，解析请求，处理请求，产生数据后，再返回给客户端，最后才断开连接，这样一个完整的请求就是这样的了。我们可以看到，一个请求，完全由worker进程来处理，而且只在一个worker进程中处理。
 
 那么，nginx采用这种进程模型有什么好处呢？当然，好处肯定会很多了。首先，对于每个worker进程来说，独立的进程，不需要加锁，所以省掉了锁带来的开销，同时在编程以及问题查找时，也会方便很多。其次，采用独立的进程，可以让互相之间不会影响，一个进程退出后，其它进程还在工作，服务不会中断，master进程则很快启动新的worker进程。当然，worker进程的异常退出，肯定是程序有bug了，异常退出，会导致当前worker上的所有请求失败，不过不会影响到所有请求，所以降低了风险。当然，好处还有很多，大家可以慢慢体会。
 
@@ -33,7 +33,7 @@ nginx在启动后，在unix系统中会以daemon的方式在后台运行，后�
 
 首先，信号的处理。对nginx来说，有一些特定的信号，代表着特定的意义。信号会中断掉程序当前的运行，在改变状态后，继续执行。如果是系统调用，则可能会导致系统调用的失败，需要重入。关于信号的处理，大家可以学习一些专业书籍，这里不多说。对于nginx来说，如果nginx正在等待事件（epoll_wait时），如果程序收到信号，在信号处理函数处理完后，epoll_wait会返回错误，然后程序可再次进入epoll_wait调用。
 
-另外，再来看看定时器。由于epoll_wait等函数在调用的时候是可以设置一个超时时间的，所以nginx借助这个超时时间来实现定时器。nginx里面的定时器事件是放在一颗维护定时器的红黑树里面，每次在进入epoll_wait前，先从该红黑树里面拿到所有定时器事件的最小时间，在计算出epoll_wait的超时时间后进入epoll_wait。所以，当没有事件产生，也没有中断信号时，epoll_wait会超时，也就是说，定时器事件到了。这时，nginx会检查所有的超时事件，将他们的状态设置为超时，然后再去处理网络事件。由此可以看出，当我们写nginx代码时，在处理网络事件的回调函数时，通常做的第一个事情就是判断超时，然后再去处理网络事件。
+另外，再来看看定时器。由于epoll_wait等函数在调用的时候是可以设置一个超时时间的，所以nginx借助这个超时时间来实现定时器。nginx里面的定时器事件是放在一棵维护定时器的红黑树里面，每次在进入epoll_wait前，先从该红黑树里面拿到所有定时器事件的最小时间，在计算出epoll_wait的超时时间后进入epoll_wait。所以，当没有事件产生，也没有中断信号时，epoll_wait会超时，也就是说，定时器事件到了。这时，nginx会检查所有的超时事件，将他们的状态设置为超时，然后再去处理网络事件。由此可以看出，当我们写nginx代码时，在处理网络事件的回调函数时，通常做的第一个事情就是判断超时，然后再去处理网络事件。
 
 我们可以用一段伪代码来总结一下nginx的事件处理模型：
 
@@ -79,7 +79,7 @@ connection
 
 当然，nginx也是可以作为客户端来请求其它server的数据的（如upstream模块），此时，与其它server创建的连接，也封装在ngx_connection_t中。作为客户端，nginx先获取一个ngx_connection_t结构体，然后创建socket，并设置socket的属性（ 比如非阻塞）。然后再通过添加读写事件，调用connect/read/write来调用连接，最后关掉连接，并释放ngx_connection_t。
 
-在nginx中，每个进程会有一个连接数的最大上限，这个上限与系统对fd的限制不一样。在操作系统中，通过ulimit -n，我们可以得到一个进程所能够打开的fd的最大数，即nofile，因为每个socket连接会占用掉一个fd，所以这也会限制我们进程的最大连接数，当然也会直接影响到我们程序所能支持的最大并发数，当fd用完后，再创建socket时，就会失败。不过，这里我要说的nginx对连接数的限制，与nofile没有直接关系，可以大于nofile，也可以小于nofile。nginx通过设置worker_connectons来设置每个进程可使用的连接最大值。nginx在实现时，是通过一个连接池来管理的，每个worker进程都有一个独立的连接池，连接池的大小是worker_connections。这里的连接池里面保存的其实不是真实的连接，它只是一个worker_connections大小的一个ngx_connection_t结构的数组。并且，nginx会通过一个链表free_connections来保存所有的空闲ngx_connection_t，每次获取一个连接时，就从空闲连接链表中获取一个，用完后，再放回空闲连接链表里面。
+在nginx中，每个进程会有一个连接数的最大上限，这个上限与系统对fd的限制不一样。在操作系统中，通过ulimit -n，我们可以得到一个进程所能够打开的fd的最大数，即nofile，因为每个socket连接会占用掉一个fd，所以这也会限制我们进程的最大连接数，当然也会直接影响到我们程序所能支持的最大并发数，当fd用完后，再创建socket时，就会失败。nginx通过设置worker_connectons来设置每个进程支持的最大连接数。如果该值大于nofile，那么实际的最大连接数是nofile，nginx会有警告。nginx在实现时，是通过一个连接池来管理的，每个worker进程都有一个独立的连接池，连接池的大小是worker_connections。这里的连接池里面保存的其实不是真实的连接，它只是一个worker_connections大小的一个ngx_connection_t结构的数组。并且，nginx会通过一个链表free_connections来保存所有的空闲ngx_connection_t，每次获取一个连接时，就从空闲连接链表中获取一个，用完后，再放回空闲连接链表里面。
 
 在这里，很多人会误解worker_connections这个参数的意思，认为这个值就是nginx所能建立连接的最大值。其实不然，这个值是表示每个worker进程所能建立连接的最大值，所以，一个nginx能建立的最大连接数，应该是worker_connections * worker_processes。当然，这里说的是最大连接数，对于HTTP请求本地资源来说，能够支持的最大并发数量是worker_connections * worker_processes，而如果是HTTP作为反向代理来说，最大并发数量应该是worker_connections * worker_processes/2。因为作为反向代理服务器，每个并发会建立与客户端的连接和与后端服务的连接，会占用两个连接。
 
@@ -119,9 +119,9 @@ request
 
 这节我们讲request，在nginx中我们指的是http请求，具体到nginx中的数据结构是ngx_http_request_t。ngx_http_request_t是对一个http请求的封装。 我们知道，一个http请求，包含请求行、请求头、请求体、响应行、响应头、响应体。
 
-http请求是典型的请求-响应类型的的网络协议，而http是文件协议，所以我们在分析请求行与请求头，以及输出响应行与响应头，往往是一行一行的进行处理。如果我们自己来写一个http服务器，通常在一个连接建立好后，客户端会发送请求过来。然后我们读取一行数据，分析出请求行中包含的method、uri、http_version信息。然后再一行一行处理请求头，并根据请求method与请求头的信息来决定是否有请求体以及请求体的长度，然后再去读取请求体。得到请求后，我们处理请求产生需要输出的数据，然后再生成响应行，响应头以及响应体。在将响应发送给客户端之后，一个完整的请求就处理完了。当然这是最简单的webserver的处理方式，其实nginx也是这样做的，只是有一些小小的区别，比如，当请求头读取完成后，就开始进行请求的处理了。nginx通过ngx_http_request_t来保存解析请求与输出响应相关的数据。
+http请求是典型的请求-响应类型的的网络协议，而http是文本协议，所以我们在分析请求行与请求头，以及输出响应行与响应头，往往是一行一行的进行处理。如果我们自己来写一个http服务器，通常在一个连接建立好后，客户端会发送请求过来。然后我们读取一行数据，分析出请求行中包含的method、uri、http_version信息。然后再一行一行处理请求头，并根据请求method与请求头的信息来决定是否有请求体以及请求体的长度，然后再去读取请求体。得到请求后，我们处理请求产生需要输出的数据，然后再生成响应行，响应头以及响应体。在将响应发送给客户端之后，一个完整的请求就处理完了。当然这是最简单的webserver的处理方式，其实nginx也是这样做的，只是有一些小小的区别，比如，当请求头读取完成后，就开始进行请求的处理了。nginx通过ngx_http_request_t来保存解析请求与输出响应相关的数据。
 
-那接下来，简要讲讲nginx是如何处理一个完整的请求的。对于nginx来说，一个请求是从ngx_http_init_request开始的，在这个函数中，会设置读事件为ngx_http_process_request_line，也就是说，接下来的网络事件，会由ngx_http_process_request_line来执行。从ngx_http_process_request_line的函数名，我们可以看到，这就是来处理请求行的，正好与之前讲的，处理请求的第一件事就是处理请求行是一致的。通过ngx_http_read_request_header来读取请求数据。然后调用ngx_http_parse_request_line函数来解析请求行。nginx为提高效率，采用状态机来解析请求行，而且在进行method的比较时，没有直接使用字符串比较，而是将四个字符转换成一个整型，然后一次比较以减少cpu的指令数，这个前面有说过。很多人可能很清楚一个请求行包含请求的方法，uri，版本，却不知道其实在请求行中，也是可以包含有host的。比如一个请求GET    http://www.taobao.com/uri HTTP/1.0这样一个请求行也是合法的，而且host是www.taobao.com，这个时候，nginx会忽略请求头中的host域，而以请求行中的这个为准来查找虚拟主机。另外，对于对于http0.9版来说，是不支持请求头的，所以这里也是要特别的处理。所以，在后面解析请求头时，协议版本都是1.0或1.1。整个请求行解析到的参数，会保存到ngx_http_request_t结构当中。
+那接下来，简要讲讲nginx是如何处理一个完整的请求的。对于nginx来说，一个请求是从ngx_http_init_request开始的，在这个函数中，会设置读事件为ngx_http_process_request_line，也就是说，接下来的网络事件，会由ngx_http_process_request_line来执行。从ngx_http_process_request_line的函数名，我们可以看到，这就是来处理请求行的，正好与之前讲的，处理请求的第一件事就是处理请求行是一致的。通过ngx_http_read_request_header来读取请求数据。然后调用ngx_http_parse_request_line函数来解析请求行。nginx为提高效率，采用状态机来解析请求行，而且在进行method的比较时，没有直接使用字符串比较，而是将四个字符转换成一个整型，然后一次比较以减少cpu的指令数，这个前面有说过。很多人可能很清楚一个请求行包含请求的方法，uri，版本，却不知道其实在请求行中，也是可以包含有host的。比如一个请求GET    http://www.taobao.com/uri HTTP/1.0这样一个请求行也是合法的，而且host是www.taobao.com，这个时候，nginx会忽略请求头中的host域，而以请求行中的这个为准来查找虚拟主机。另外，对于http0.9版来说，是不支持请求头的，所以这里也是要特别的处理。所以，在后面解析请求头时，协议版本都是1.0或1.1。整个请求行解析到的参数，会保存到ngx_http_request_t结构当中。
 
 在解析完请求行后，nginx会设置读事件的handler为ngx_http_process_request_headers，然后后续的请求就在ngx_http_process_request_headers中进行读取与解析。ngx_http_process_request_headers函数用来读取请求头，跟请求行一样，还是调用ngx_http_read_request_header来读取请求头，调用ngx_http_parse_header_line来解析一行请求头，解析到的请求头会保存到ngx_http_request_t的域headers_in中，headers_in是一个链表结构，保存所有的请求头。而HTTP中有些请求是需要特别处理的，这些请求头与请求处理函数存放在一个映射表里面，即ngx_http_headers_in，在初始化时，会生成一个hash表，当每解析到一个请求头后，就会先在这个hash表中查找，如果有找到，则调用相应的处理函数来处理这个请求头。比如:Host头的处理函数是ngx_http_process_host。
 
@@ -151,7 +151,7 @@ keepalive
 
 pipe
 ^^^^^^^^^^^^^^^^^
-在http1.1中，引入了一种新的特性，即pipeline。那么什么是pipeline呢？pipeline其实就是流水线作业，它可以看作为keepalive的一种升华，因为pipeline也是基于长连接的，目的就是利用一个连接做多次请求。如果客户端要提交多个请求，对于keepalive来说，那么第二个请求，必须要等到第一个请求的响应接收完全后，才能发起，也就是说，请求是串行进行的，一个请求接着下一个请求。注意，一个完整的请求，包括发送请求，处理请求，响应请求。而对pipeline来说，客户端不必等到第一个请求处理完后，就可以马上发起第二个请求。我们知道，tcp连接是全双工的，发送与接收可以同时进行，所以，我们可以将多个请求头依次发送出去，在服务端依次处理，客户端再依次接收，这样就多个请求就是同时进行的了。nginx是直接支持pipeline的，但是，nginx对pipeline中的多个请求的处理却不是并行的，依然是一个请求接一个请求的处理，只是在处理第一个请求的时候，客户端就可以发起第二个请求。这样，nginx利用pipeline减少了处理完一个请求后，等待第二个请求的请求头数据的时间。其实nginx的做法很简单，前面说到，nginx在读取数据时，会将读取的数据放到一个buffer里面，所以，如果nginx在处理完前一个请求后，如果发现buffer里面还有数据，就认为剩下的数据是下一个请求的开始，然后就接下来处理下一个请求，否则就设置keepalive。
+在http1.1中，引入了一种新的特性，即pipeline。那么什么是pipeline呢？pipeline其实就是流水线作业，它可以看作为keepalive的一种升华，因为pipeline也是基于长连接的，目的就是利用一个连接做多次请求。如果客户端要提交多个请求，对于keepalive来说，那么第二个请求，必须要等到第一个请求的响应接收完全后，才能发起，这和TCP的停止等待协议是一样的，得到两个响应的时间至少为2*RTT。而对pipeline来说，客户端不必等到第一个请求处理完后，就可以马上发起第二个请求。得到两个响应的时间可能能够达到1*RTT。nginx是直接支持pipeline的，但是，nginx对pipeline中的多个请求的处理却不是并行的，依然是一个请求接一个请求的处理，只是在处理第一个请求的时候，客户端就可以发起第二个请求。这样，nginx利用pipeline减少了处理完一个请求后，等待第二个请求的请求头数据的时间。其实nginx的做法很简单，前面说到，nginx在读取数据时，会将读取的数据放到一个buffer里面，所以，如果nginx在处理完前一个请求后，如果发现buffer里面还有数据，就认为剩下的数据是下一个请求的开始，然后就接下来处理下一个请求，否则就设置keepalive。
 
 lingering_close
 ^^^^^^^^^^^^^^^^^
@@ -179,7 +179,7 @@ ngx_str_t(100%)
         u_char     *data;
     } ngx_str_t;
 
-从结构体当中，data指向字符串数据的第一个字符，字符串的结束用长度来表示，而不是由'\\0'来表示结束。所以，在写nginx代码时，处理字符串的方法跟我们平时使用有很大的不一样，但要时刻记住，字符串不以'\\0'结束，尽量使用nginx提供的字符串操作的api来操作字符串。
+在结构体当中，data指向字符串数据的第一个字符，字符串的结束用长度来表示，而不是由'\\0'来表示结束。所以，在写nginx代码时，处理字符串的方法跟我们平时使用有很大的不一样，但要时刻记住，字符串不以'\\0'结束，尽量使用nginx提供的字符串操作的api来操作字符串。
 那么，nginx这样做有什么好处呢？首先，通过长度来表示字符串长度，减少计算字符串长度的次数。其次，nginx可以重复引用一段字符串内存，data可以指向任意内存，长度表示结束，而不用去copy一份自己的字符串(因为如果要以'\\0'结束，而不能更改原字符串，所以势必要copy一段字符串)。我们在ngx_http_request_t结构体的成员中，可以找到很多字符串引用一段内存的例子，比如request_line、uri、args等等，这些字符串的data部分，都是指向在接收数据时创建buffer所指向的内存中，uri，args就没有必要copy一份出来。这样的话，减少了很多不必要的内存分配与拷贝。
 正是基于此特性，在nginx中，必须谨慎的去修改一个字符串。在修改字符串时需要认真的去考虑：是否可以修改该字符串；字符串修改后，是否会对其它的引用造成影响。在后面介绍ngx_unescape_uri函数的时候，就会看到这一点。但是，使用nginx的字符串会产生一些问题，glibc提供的很多系统api函数大多是通过'\\0'来表示字符串的结束，所以我们在调用系统api时，就不能直接传入str->data了。此时，通常的做法是创建一段str->len + 1大小的内存，然后copy字符串，最后一个字节置为'\\0'。比较hack的做法是，将字符串最后一个字符的后一个字符backup一个，然后设置为'\\0'，在做完调用后，再由backup改回来，但前提条件是，你得确定这个字符是可以修改的，而且是有内存分配，不会越界，但一般不建议这么做。
 接下来，看看nginx提供的操作字符串相关的api。
@@ -195,7 +195,7 @@ ngx_string(str)是一个宏，它通过一个以'\\0'结尾的普通字符串str
 
     #define ngx_null_string     { 0, NULL }
 
-定义变量时，使用ngx_null_string初始化字符串为空字符串，符串的长度为0，data为NULL。
+定义变量时，使用ngx_null_string初始化字符串为空字符串，字符串的长度为0，data为NULL。
 
 .. code:: c
 
@@ -215,9 +215,9 @@ ngx_str_null用于设置字符串str为空串，长度为0，data为NULL。
 .. code:: c
 
     ngx_str_t str = ngx_string("hello world");
-    ngx_str_t str1 = ngx_null_string();
+    ngx_str_t str1 = ngx_null_string;
 
-如果向下面这样使用，就会有问题，这里涉及到c语言中对结构体变量赋值操作的语法规则，在此不做介绍。
+如果像下面这样使用，就会有问题，这里涉及到c语言中对结构体变量赋值操作的语法规则，在此不做介绍。
 
 .. code:: c
 
@@ -230,7 +230,7 @@ ngx_str_null用于设置字符串str为空串，长度为0，data为NULL。
 .. code:: c
 
     ngx_str_t str, str1;
-    ngx_str_set(&str, "hello world");    
+    ngx_str_set(&str, "hello world");
     ngx_str_null(&str1);
 
 按照C99标准，您也可以这么做：
@@ -241,7 +241,7 @@ ngx_str_null用于设置字符串str为空串，长度为0，data为NULL。
     str  = (ngx_str_t) ngx_string("hello world");
     str1 = (ngx_str_t) ngx_null_string;
 
-另外要注意的是，ngx_string与ngx_str_set在调用时，传进去的字符串一定是常量字符串，否则会得到意想不到的错误(因为ngx_str_set内部使用了sizeof()，如果传入的是u_char*，那么计算的是这个指针的长度，而不是字符串的长度)。如： 
+另外要注意的是，ngx_string与ngx_str_set在调用时，传进去的字符串一定是常量字符串，否则会得到意想不到的错误(因为ngx_str_set内部使用了sizeof()，如果传入的是u_char*，那么计算的是这个指针的长度，而不是字符串的长度)。如：
 
 .. code:: c
 
@@ -342,7 +342,7 @@ ngx_str_null用于设置字符串str为空串，长度为0，data为NULL。
 .. code:: c
 
     ngx_str_t str = ngx_string("hello world");
-    char buffer[1024];
+    u_char buffer[1024];
     ngx_snprintf(buffer, 1024, "%V", &str);    // 注意，str取地址
 
 .. code:: c
@@ -389,17 +389,17 @@ ngx_pool_t是一个非常重要的数据结构，在很多重要的场合都有�
 
 例如对于内存的管理，如果我们需要使用内存，那么总是从一个ngx_pool_t的对象中获取内存，在最终的某个时刻，我们销毁这个ngx_pool_t对象，所有这些内存都被释放了。这样我们就不必要对对这些内存进行malloc和free的操作，不用担心是否某块被malloc出来的内存没有被释放。因为当ngx_pool_t对象被销毁的时候，所有从这个对象中分配出来的内存都会被统一释放掉。
 
-在比如我们要使用一系列的文件，但是我们打开以后，最终需要都关闭，那么我们就把这些文件统一登记到一个ngx_pool_t对象中，当这个ngx_pool_t对象被销毁的时候，所有这些文件都将会被关闭。
+再比如我们要使用一系列的文件，但是我们打开以后，最终需要都关闭，那么我们就把这些文件统一登记到一个ngx_pool_t对象中，当这个ngx_pool_t对象被销毁的时候，所有这些文件都将会被关闭。
 
-从上面举的两个例子中我们可以看出，使用ngx_pool_t这个数据结构的时候，所有的资源的释放都在这个对象被销毁的时刻，统一进行了释放，那么就会带来一个问题，就是这些资源的生存周期（或者说被占用的时间）是跟ngx_pool_t的生存周期基本一致（ngx_pool_t也提供了少量操作可以提前释放资源）。从最高效的角度来说，这并不是最好的。比如，我们需要依次使用A，B，C三个资源，且使用完B的时候，A就不会再被使用了，使用C的时候A和B都不会被使用到。如果不使用ngx_pool_t来管理这三个资源，那我们可能从系统里面申请A，使用A，然后在释放A。接着申请B，使用B，再释放B。最后申请C，使用C，然后释放C。但是当我们使用一个ngx_pool_t对象来管理这三个资源的时候，A，B和C的释放是在最后一起发生的，也就是在使用完C以后。诚然，这在客观上增加了程序在一段时间的资源使用量。但是这也减轻了程序员分别管理三个资源的生命周期的工作。这也就是有所得，必有所失的道理。实际上是一个取舍的问题，在具体的情况下，你更在乎的是哪个。
+从上面举的两个例子中我们可以看出，使用ngx_pool_t这个数据结构的时候，所有的资源的释放都在这个对象被销毁的时刻，统一进行了释放，那么就会带来一个问题，就是这些资源的生存周期（或者说被占用的时间）是跟ngx_pool_t的生存周期基本一致（ngx_pool_t也提供了少量操作可以提前释放资源）。从最高效的角度来说，这并不是最好的。比如，我们需要依次使用A，B，C三个资源，且使用完B的时候，A就不会再被使用了，使用C的时候A和B都不会被使用到。如果不使用ngx_pool_t来管理这三个资源，那我们可能从系统里面申请A，使用A，然后在释放A。接着申请B，使用B，再释放B。最后申请C，使用C，然后释放C。但是当我们使用一个ngx_pool_t对象来管理这三个资源的时候，A，B和C的释放是在最后一起发生的，也就是在使用完C以后。诚然，这在客观上增加了程序在一段时间的资源使用量。但是这也减轻了程序员分别管理三个资源的生命周期的工作。这也就是有所得，必有所失的道理。实际上是一个取舍的问题，要看在具体的情况下，你更在乎的是哪个。
 
 可以看一下在nginx里面一个典型的使用ngx_pool_t的场景，对于nginx处理的每个http request, nginx会生成一个ngx_pool_t对象与这个http request关联，所有处理过程中需要申请的资源都从这个ngx_pool_t对象中获取，当这个http request处理完成以后，所有在处理过程中申请的资源，都将随着这个关联的ngx_pool_t对象的销毁而释放。
 
 ngx_pool_t相关结构及操作被定义在文件src/core/ngx_palloc.h|c中。
 
-.. code:: c 
+.. code:: c
 
-    typedef struct ngx_pool_s        ngx_pool_t; 
+    typedef struct ngx_pool_s        ngx_pool_t;
 
     struct ngx_pool_s {
         ngx_pool_data_t       d;
@@ -416,30 +416,30 @@ ngx_pool_t相关结构及操作被定义在文件src/core/ngx_palloc.h|c中。
 
 下面我们来分别解释下ngx_pool_t的相关操作。
 
-.. code:: c  
+.. code:: c
 
     ngx_pool_t *ngx_create_pool(size_t size, ngx_log_t *log);
-                                                              
-                                                              
-创建一个初始节点大小为size的pool，log为后续在该pool上进行操作时输出日志的对象。 需要说明的是size的选择，size的大小必须小于等于NGX_MAX_ALLOC_FROM_POOL，且必须大于sizeof(ngx_pool_t)。 
 
-选择大于NGX_MAX_ALLOC_FROM_POOL的值会造成浪费，因为大于该限制的空间不会被用到（只是说在第一个由ngx_pool_t对象管理的内存块上的内存，后续的分配如果第一个内存块上的空闲部分已用完，会再分配的）。 
+
+创建一个初始节点大小为size的pool，log为后续在该pool上进行操作时输出日志的对象。 需要说明的是size的选择，size的大小必须小于等于NGX_MAX_ALLOC_FROM_POOL，且必须大于sizeof(ngx_pool_t)。
+
+选择大于NGX_MAX_ALLOC_FROM_POOL的值会造成浪费，因为大于该限制的空间不会被用到（只是说在第一个由ngx_pool_t对象管理的内存块上的内存，后续的分配如果第一个内存块上的空闲部分已用完，会再分配的）。
 
 选择小于sizeof(ngx_pool_t)的值会造成程序崩溃。由于初始大小的内存块中要用一部分来存储ngx_pool_t这个信息本身。
 
 当一个ngx_pool_t对象被创建以后，该对象的max字段被赋值为size-sizeof(ngx_pool_t)和NGX_MAX_ALLOC_FROM_POOL这两者中比较小的。后续的从这个pool中分配的内存块，在第一块内存使用完成以后，如果要继续分配的话，就需要继续从操作系统申请内存。当内存的大小小于等于max字段的时候，则分配新的内存块，链接在d这个字段（实际上是d.next字段）管理的一条链表上。当要分配的内存块是比max大的，那么从系统中申请的内存是被挂接在large字段管理的一条链表上。我们暂且把这个称之为大块内存链和小块内存链。
 
 
-.. code:: c   
+.. code:: c
 
-    void *ngx_palloc(ngx_pool_t *pool, size_t size); 
+    void *ngx_palloc(ngx_pool_t *pool, size_t size);
 
-从这个pool中分配一块为size大小的内存。注意，此函数分配的内存的起始地址按照NGX_ALIGNMENT进行了对齐。对齐操作会提高系统处理的速度，但会造成少量内存的浪费。 
+从这个pool中分配一块为size大小的内存。注意，此函数分配的内存的起始地址按照NGX_ALIGNMENT进行了对齐。对齐操作会提高系统处理的速度，但会造成少量内存的浪费。
 
 
-.. code:: c   
+.. code:: c
 
-    void *ngx_pnalloc(ngx_pool_t *pool, size_t size); 
+    void *ngx_pnalloc(ngx_pool_t *pool, size_t size);
 
 从这个pool中分配一块为size大小的内存。但是此函数分配的内存并没有像上面的函数那样进行过对齐。
 
@@ -448,17 +448,17 @@ ngx_pool_t相关结构及操作被定义在文件src/core/ngx_palloc.h|c中。
 
     void *ngx_pcalloc(ngx_pool_t *pool, size_t size);
 
-该函数也是分配size大小的内存，并且对分配的内存块进行了清零。内部实际上是转调用ngx_palloc实现的。 
+该函数也是分配size大小的内存，并且对分配的内存块进行了清零。内部实际上是转调用ngx_palloc实现的。
 
 
-.. code:: c 
+.. code:: c
 
     void *ngx_pmemalign(ngx_pool_t *pool, size_t size, size_t alignment);
 
-按照指定对齐大小alignment来申请一块大小为size的内存。此处获取的内存不管大小都将被置于大内存块链中管理。 
+按照指定对齐大小alignment来申请一块大小为size的内存。此处获取的内存不管大小都将被置于大内存块链中管理。
 
 
-.. code:: c  
+.. code:: c
 
     ngx_int_t ngx_pfree(ngx_pool_t *pool, void *p);
 
@@ -467,13 +467,13 @@ ngx_pool_t相关结构及操作被定义在文件src/core/ngx_palloc.h|c中。
 由于这个操作效率比较低下，除非必要，也就是说这块内存非常大，确应及时释放，否则一般不需要调用。反正内存在这个pool被销毁的时候，总归会都释放掉的嘛！
 
 
-.. code:: c 
+.. code:: c
 
-    ngx_pool_cleanup_t *ngx_pool_cleanup_add(ngx_pool_t *p, size_t size); 
+    ngx_pool_cleanup_t *ngx_pool_cleanup_add(ngx_pool_t *p, size_t size);
 
-ngx_pool_t中的cleanup字段管理着一个特殊的链表，该链表的每一项都记录着一个特殊的需要释放的资源。对于这个链表中每个节点所包含的资源如何去释放，是自说明的。这也就提供了非常大的灵活性。意味着，ngx_pool_t不仅仅可以管理内存，通过这个机制，也可以管理任何需要释放的资源，例如，关闭文件，或者删除文件等等的。下面我们看一下这个链表每个节点的类型: 
+ngx_pool_t中的cleanup字段管理着一个特殊的链表，该链表的每一项都记录着一个特殊的需要释放的资源。对于这个链表中每个节点所包含的资源如何去释放，是自说明的。这也就提供了非常大的灵活性。意味着，ngx_pool_t不仅仅可以管理内存，通过这个机制，也可以管理任何需要释放的资源，例如，关闭文件，或者删除文件等等。下面我们看一下这个链表每个节点的类型:
 
-.. code:: c  
+.. code:: c
 
     typedef struct ngx_pool_cleanup_s  ngx_pool_cleanup_t;
     typedef void (*ngx_pool_cleanup_pt)(void *data);
@@ -484,35 +484,35 @@ ngx_pool_t中的cleanup字段管理着一个特殊的链表，该链表的每一
         ngx_pool_cleanup_t   *next;
     };
 
-:data: 指明了该节点所对应的资源。 
+:data: 指明了该节点所对应的资源。
 
-:handler: 是一个函数指针，指向一个可以释放data所对应资源的函数。该函数的只有一个参数，就是data。 
+:handler: 是一个函数指针，指向一个可以释放data所对应资源的函数。该函数只有一个参数，就是data。
 
 :next: 指向该链表中下一个元素。
 
-看到这里，ngx_pool_cleanup_add这个函数的用法，我相信大家都应该有一些明白了。但是这个参数size是起什么作用的呢？这个 size就是要存储这个data字段所指向的资源的大小。
+看到这里，ngx_pool_cleanup_add这个函数的用法，我相信大家都应该有一些明白了。但是这个参数size是起什么作用的呢？这个size就是要存储这个data字段所指向的资源的大小，该函数会为data分配size大小的空间。
 
 比如我们需要最后删除一个文件。那我们在调用这个函数的时候，把size指定为存储文件名的字符串的大小，然后调用这个函数给cleanup链表中增加一项。该函数会返回新添加的这个节点。我们然后把这个节点中的data字段拷贝为文件名。把hander字段赋值为一个删除文件的函数（当然该函数的原型要按照void (\*ngx_pool_cleanup_pt)(void \*data)）。
 
 
-.. code:: c 
+.. code:: c
 
     void ngx_destroy_pool(ngx_pool_t *pool);
 
-该函数就是释放pool中持有的所有内存，以及依次调用cleanup字段所管理的链表中每个元素的handler字段所指向的函数，来释放掉所有该pool管理的资源。并且把pool指向的ngx_pool_t也释放掉了，完全不可用了。 
+该函数就是释放pool中持有的所有内存，以及依次调用cleanup字段所管理的链表中每个元素的handler字段所指向的函数，来释放掉所有该pool管理的资源。并且把pool指向的ngx_pool_t也释放掉了，完全不可用了。
 
 
-.. code:: c 
+.. code:: c
 
     void ngx_reset_pool(ngx_pool_t *pool);
 
-该函数释放pool中所有大块内存链表上的内存，小块内存链上的内存块都修改为可用。但是不会去处理cleanup链表上的项目。 
+该函数释放pool中所有大块内存链表上的内存，小块内存链上的内存块都修改为可用。但是不会去处理cleanup链表上的项目。
 
 
 ngx_array_t(100%)
 ~~~~~~~~~~~~~~~~~~~~
 
-ngx_array_t是nginx内部使用的数组结构。nginx的数组结构在存储上与大家认知的C语言内置的数组有相似性，比如实际上存储数据的区域也是一大块连续的内存。但是数组除了存储数据的内存以外还包含一些元信息来描述相关的一些信息。下面我们从数组的定义上来详细的了解一下。ngx_array_t的定义位于src/core/ngx_array.c|h里面。 
+ngx_array_t是nginx内部使用的数组结构。nginx的数组结构在存储上与大家认知的C语言内置的数组有相似性，比如实际上存储数据的区域也是一大块连续的内存。但是数组除了存储数据的内存以外还包含一些元信息来描述相关的一些信息。下面我们从数组的定义上来详细的了解一下。ngx_array_t的定义位于src/core/ngx_array.c|h里面。
 
 .. code:: c
 
@@ -526,13 +526,13 @@ ngx_array_t是nginx内部使用的数组结构。nginx的数组结构在存储�
     };
 
 
-:elts: 指向实际的数据存储区域。 
+:elts: 指向实际的数据存储区域。
 
 :nelts: 数组实际元素个数。
- 
-:size: 数组单个元素的大小，单位是字节。 
 
-:nalloc: 数组的容量。表示该数组在不引发扩容的前提下，可以最多存储的元素的个数。当nelts增长到达nalloc 时，如果再往此数组中存储元素，则会引发数组的扩容。数组的容量将会扩展到原有容量的2倍大小。实际上是分配新的一块内存，新的一块内存的大小是原有内存大小的2倍。原有的数据会被拷贝到新的一块内存中。 
+:size: 数组单个元素的大小，单位是字节。
+
+:nalloc: 数组的容量。表示该数组在不引发扩容的前提下，可以最多存储的元素的个数。当nelts增长到达nalloc时，如果再往此数组中存储元素，则会引发数组的扩容。数组的容量将会扩展到原有容量的2倍大小。实际上是分配新的一块内存，新的一块内存的大小是原有内存大小的2倍。原有的数据会被拷贝到新的一块内存中。
 
 :pool: 该数组用来分配内存的内存池。
 
@@ -545,32 +545,32 @@ ngx_array_t是nginx内部使用的数组结构。nginx的数组结构在存储�
 
     ngx_array_t *ngx_array_create(ngx_pool_t *p, ngx_uint_t n, size_t size);
 
-创建一个新的数组对象，并返回这个对象。 
+创建一个新的数组对象，并返回这个对象。
 
 :p: 数组分配内存使用的内存池；
-:n: 数组的初始容量大小，即可以在不扩容的情况下最多可以容纳的元素个数。
+:n: 数组的初始容量大小，即在不扩容的情况下最多可以容纳的元素个数。
 :size: 单个元素的大小，单位是字节。
 
 
-.. code:: c 
+.. code:: c
 
     void ngx_array_destroy(ngx_array_t *a);
 
 销毁该数组对象，并释放其分配的内存回内存池。
 
 
-.. code:: c 
+.. code:: c
 
     void *ngx_array_push(ngx_array_t *a);
 
-在数组a上新追加一个元素，并返回指向新元素的指针。需要把返回的指针使用类型转换，转换为具体的类型，然后再给新元素本身或者是各字段（如果数组的元素是复杂类型）赋值。 
+在数组a上新追加一个元素，并返回指向新元素的指针。需要把返回的指针使用类型转换，转换为具体的类型，然后再给新元素本身或者是各字段（如果数组的元素是复杂类型）赋值。
 
 
-.. code:: c 
+.. code:: c
 
     void *ngx_array_push_n(ngx_array_t *a, ngx_uint_t n);
 
-在数组a上追加n个元素，并返回指向这些追加元素的首个元素的位置的指针。 
+在数组a上追加n个元素，并返回指向这些追加元素的首个元素的位置的指针。
 
 
 .. code:: c
@@ -580,24 +580,24 @@ ngx_array_t是nginx内部使用的数组结构。nginx的数组结构在存储�
 如果一个数组对象是被分配在堆上的，那么当调用ngx_array_destroy销毁以后，如果想再次使用，就可以调用此函数。
 
 如果一个数组对象是被分配在栈上的，那么就需要调用此函数，进行初始化的工作以后，才可以使用。
- 
 
-**注意事项\:** 
-数组在扩容时，旧的内存不会被释放，会造成内存的浪费。因此，最好能提前规划好数组的容量，在创建或者初始化的时候一次搞定，避免多次扩容，造成内存浪费。
+
+**注意事项\:**
+由于使用ngx_palloc分配内存，数组在扩容时，旧的内存不会被释放，会造成内存的浪费。因此，最好能提前规划好数组的容量，在创建或者初始化的时候一次搞定，避免多次扩容，造成内存浪费。
 
 
 
 ngx_hash_t(100%)
 ~~~~~~~~~~~~~~~~~~
 
-ngx_hash_t是nginx自己的hash表的实现。定义和实现位于src/core/ngx_hash.h|c中。ngx_hash_t的实现也与数据结构教课书上所描述的hash表的实现是大同小异。对于常用的解决冲突的方法有线性探测，二次探测和开链法等。ngx_hash_t使用的是最常用的一种，也就是开链法，这也是STL中的hash表使用的方法。 
+ngx_hash_t是nginx自己的hash表的实现。定义和实现位于src/core/ngx_hash.h|c中。ngx_hash_t的实现也与数据结构教科书上所描述的hash表的实现是大同小异。对于常用的解决冲突的方法有线性探测，二次探测和开链法等。ngx_hash_t使用的是最常用的一种，也就是开链法，这也是STL中的hash表使用的方法。
 
 但是ngx_hash_t的实现又有其几个显著的特点:
 
 1. ngx_hash_t不像其他的hash表的实现，可以插入删除元素，它只能一次初始化，就构建起整个hash表以后，既不能再删除，也不能在插入元素了。
 2. ngx_hash_t的开链并不是真的开了一个链表，实际上是开了一段连续的存储空间，几乎可以看做是一个数组。这是因为ngx_hash_t在初始化的时候，会经历一次预计算的过程，提前把每个桶里面会有多少元素放进去给计算出来，这样就提前知道每个桶的大小了。那么就不需要使用链表，一段连续的存储空间就足够了。这也从一定程度上节省了内存的使用。
 
-从上面的描述，我们可以看出来，实际上ngx_hash_t的使用是非常简单。就两步，首先是初始化，然后就可以在里面进行查找了。下面我们详细来看一下。
+从上面的描述，我们可以看出来，这个值越大，越造成内存的浪费。就两步，首先是初始化，然后就可以在里面进行查找了。下面我们详细来看一下。
 
 ngx_hash_t的初始化。
 
@@ -607,17 +607,17 @@ ngx_hash_t的初始化。
     ngx_int_t ngx_hash_init(ngx_hash_init_t *hinit, ngx_hash_key_t *names,
  ngx_uint_t nelts);
 
-首先我们来看一下初始化函数。该函数的第一个参数hinit是初始化的一些参数的一个集合。 names是初始化一个ngx_hash_t所需要的所有key的一个数组。而nelts就是key的个数。下面先看一下ngx_hash_init_t类型，该类型提供了初始化一个hash表所需要的一些基本信息。 
+首先我们来看一下初始化函数。该函数的第一个参数hinit是初始化的一些参数的一个集合。 names是初始化一个ngx_hash_t所需要的所有key的一个数组。而nelts就是key的个数。下面先看一下ngx_hash_init_t类型，该类型提供了初始化一个hash表所需要的一些基本信息。
 
 .. code:: c
 
     typedef struct {
         ngx_hash_t       *hash;
         ngx_hash_key_pt   key;
-    
+
         ngx_uint_t        max_size;
         ngx_uint_t        bucket_size;
-    
+
         char             *name;
         ngx_pool_t       *pool;
         ngx_pool_t       *temp_pool;
@@ -628,14 +628,14 @@ ngx_hash_t的初始化。
 
 :key: 指向从字符串生成hash值的hash函数。nginx的源代码中提供了默认的实现函数ngx_hash_key_lc。
 
-:max_size: hash表中的桶的个数。该字段越大，元素存储时冲突的可能性越小，每个桶中存储的元素会更少，则查询起来的速度更快。当然，这个值越大，越造成内存的浪费，(实际上也浪费不了多少)。
+:max_size: hash表中的桶的个数。该字段越大，元素存储时冲突的可能性越小，每个桶中存储的元素会更少，则查询起来的速度更快。当然，这个值越大，越造成内存的浪费也越大，(实际上也浪费不了多少)。
 
 :bucket_size: 每个桶的最大限制大小，单位是字节。如果在初始化一个hash表的时候，发现某个桶里面无法存的下所有属于该桶的元素，则hash表初始化失败。
 
 :name: 该hash表的名字。
 
 :pool: 该hash表分配内存使用的pool。
- 
+
 
 :temp_pool: 该hash表使用的临时pool，在初始化完成以后，该pool可以被释放和销毁掉。
 
@@ -680,15 +680,15 @@ nginx为了处理带有通配符的域名的匹配问题，实现了ngx_hash_wil
     ngx_int_t ngx_hash_wildcard_init(ngx_hash_init_t *hinit, ngx_hash_key_t *names,
         ngx_uint_t nelts);
 
-该函数迎来构建一个可以包含通配符key的hash表。
+该函数用来构建一个可以包含通配符key的hash表。
 
 :hinit: 构造一个通配符hash表的一些参数的一个集合。关于该参数对应的类型的说明，请参见ngx_hash_t类型中ngx_hash_init函数的说明。
 
-:names: 构造此hash表的所有的通配符key的数组。特别要注意的是这里的key已经都是被预处理过的。例如：“\*.abc.com”或者“.abc.com”被预处理完成以后，变成了“com.abc.”。而“mail.xxx.\*”则被预处理为“mail.xxx.”。为什么会被处理这样？这里不得不简单地描述一下通配符hash表的实现原理。当构造此类型的hash表的时候，实际上是构造了一个hash表的一个“链表”，是通过hash表中的key“链接”起来的。比如：对于“\*.abc.com”将会构造出2个hash表，第一个hash表中有一个key为com的表项，该表项的value包含有指向第二个hash表的指针，而第二个hash表中有一个表项abc，该表项的value包含有指向\*.abc.com对应的value的指针。那么查询的时候，比如查询www.abc.com的时候，先查com，通过查com可以找到第二级的hash表，在第二级hash表中，再查找abc，依次类推，直到在某一级的hash表中查到的表项对应的value对应一个真正的值而非一个指向下一级hash表的指针的时候，查询过程结束。**这里有一点需要特别注意的，就是names数组中元素的value所对应的值（也就是真正的value所在的地址）必须是能被4整除的，或者说是在4的倍数的地址上是对齐的。因为这个value的值的低两位bit是有用的，所以必须为0。如果不满足这个条件，这个hash表查询不出正确结果。**
+:names: 构造此hash表的所有的通配符key的数组。特别要注意的是这里的key已经都是被预处理过的。例如：“\*.abc.com”或者“.abc.com”被预处理完成以后，变成了“com.abc.”。而“mail.xxx.\*”则被预处理为“mail.xxx.”。为什么会被处理这样？这里不得不简单地描述一下通配符hash表的实现原理。当构造此类型的hash表的时候，实际上是构造了一个hash表的一个“链表”，是通过hash表中的key“链接”起来的。比如：对于“\*.abc.com”将会构造出2个hash表，第一个hash表中有一个key为com的表项，该表项的value包含有指向第二个hash表的指针，而第二个hash表中有一个表项abc，该表项的value包含有指向\*.abc.com对应的value的指针。那么查询的时候，比如查询www.abc.com的时候，先查com，通过查com可以找到第二级的hash表，在第二级hash表中，再查找abc，依次类推，直到在某一级的hash表中查到的表项对应的value对应一个真正的值而非一个指向下一级hash表的指针的时候，查询过程结束。**这里有一点需要特别注意的，就是names数组中元素的value值低两位bit必须为0（有特殊用途）。如果不满足这个条件，这个hash表查询不出正确结果。**
 
 
 :nelts: names数组元素的个数。
- 
+
 
 该函数执行成功返回NGX_OK，否则NGX_ERROR。
 
@@ -711,18 +711,18 @@ nginx为了处理带有通配符的域名的匹配问题，实现了ngx_hash_wil
 
 
 .. code:: c
-    
+
     void *ngx_hash_find_wc_tail(ngx_hash_wildcard_t *hwc, u_char *name, size_t len);
 
 该函数查询包含通配符在末尾的key的hash表的。
-参数及返回值请参加上个函数的说明。
+参数及返回值请参见上个函数的说明。
 
 
 ngx_hash_combined_t(100%)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 组合类型hash表，该hash表的定义如下：
- 
+
 .. code:: c
 
     typedef struct {
@@ -736,7 +736,7 @@ ngx_hash_combined_t(100%)
 
 nginx提供该类型的作用，在于提供一个方便的容器包含三个类型的hash表，当有包含通配符的和不包含通配符的一组key构建hash表以后，以一种方便的方式来查询，你不需要再考虑一个key到底是应该到哪个类型的hash表里去查了。
 
-构造这样一组合hash表的时候，首先定义一个该类型的变量，在分别构造其包含的三个子hash表即可。
+构造这样一组合hash表的时候，首先定义一个该类型的变量，再分别构造其包含的三个子hash表即可。
 
 对于该类型hash表的查询，nginx提供了一个方便的函数ngx_hash_find_combined。
 
@@ -755,7 +755,7 @@ nginx提供该类型的作用，在于提供一个方便的容器包含三个类
 返回查询的结果，未查到则返回NULL。
 
 
-ngx_hash_keys_arrays_t(100%) 
+ngx_hash_keys_arrays_t(100%)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 大家看到在构建一个ngx_hash_wildcard_t的时候，需要对通配符的哪些key进行预处理。这个处理起来比较麻烦。而当有一组key，这些里面既有无通配符的key，也有包含通配符的key的时候。我们就需要构建三个hash表，一个包含普通的key的hash表，一个包含前向通配符的hash表，一个包含后向通配符的hash表（或者也可以把这三个hash表组合成一个ngx_hash_combined_t）。在这种情况下，为了让大家方便的构造这些hash表，nginx提供给了此辅助类型。
@@ -767,16 +767,16 @@ ngx_hash_keys_arrays_t(100%)
 
     typedef struct {
         ngx_uint_t        hsize;
-    
+
         ngx_pool_t       *pool;
         ngx_pool_t       *temp_pool;
-    
+
         ngx_array_t       keys;
         ngx_array_t      *keys_hash;
-    
+
         ngx_array_t       dns_wc_head;
         ngx_array_t      *dns_wc_head_hash;
-    
+
         ngx_array_t       dns_wc_tail;
         ngx_array_t      *dns_wc_tail_hash;
     } ngx_hash_keys_arrays_t;
@@ -803,7 +803,7 @@ ngx_hash_keys_arrays_t(100%)
 
 
 
-在定义一个这个类型的变量，并对字段pool和temp_pool赋值以后，就可以调用函数ngx_hash_add_key把所有的key加入到这个结构中了，该函数会自动实现普通key，带前向通配符的key和带后向通配符的key的分类和检查，并将这个些值存放到对应的字段中去，
+在定义一个这个类型的变量，并对字段pool和temp_pool赋值以后，就可以调用函数ngx_hash_add_key把所有的key加入到这个结构中了，该函数会自动实现普通key，带前向通配符的key和带后向通配符的key的分类和检查，并将这些值存放到对应的字段中去，
 然后就可以通过检查这个结构体中的keys、dns_wc_head、dns_wc_tail三个数组是否为空，来决定是否构建普通hash表，前向通配符hash表和后向通配符hash表了（在构建这三个类型的hash表的时候，可以分别使用keys、dns_wc_head、dns_wc_tail三个数组）。
 
 构建出这三个hash表以后，可以组合在一个ngx_hash_combined_t对象中，使用ngx_hash_find_combined进行查找。或者是仍然保持三个独立的变量对应这三个hash表，自己决定何时以及在哪个hash表中进行查询。
@@ -811,7 +811,7 @@ ngx_hash_keys_arrays_t(100%)
 .. code:: c
 
     ngx_int_t ngx_hash_keys_array_init(ngx_hash_keys_arrays_t *ha, ngx_uint_t type);
- 
+
 
 初始化这个结构，主要是对这个结构中的ngx_array_t类型的字段进行初始化，成功返回NGX_OK。
 
@@ -838,7 +838,7 @@ ngx_hash_keys_arrays_t(100%)
 有关于这个数据结构的使用，可以参考src/http/ngx_http.c中的ngx_http_server_names函数。
 
 
-ngx_chain_t(100%) 
+ngx_chain_t(100%)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
@@ -873,12 +873,12 @@ nginx的filter模块在处理从别的filter模块或者是handler模块传递�
 
 该宏释放一个ngx_chain_t类型的对象。如果要释放整个chain，则迭代此链表，对每个节点使用此宏即可。
 
-**注意\:** 对ngx_chaint_t类型的释放，并不是真的释放了内存，而仅仅是把这个对象挂在了这个pool对象的一个叫做chain的字段对应的chain上，以供下次从这个pool上分配ngx_chain_t类型对象的时候，快速的从这个pool->chain上取下链首元素就返回了，当然，如果这个链是空的，才会真的在这个pool上使用ngx_palloc函数进行分配。 
+**注意\:** 对ngx_chain_t类型的释放，并不是真的释放了内存，而仅仅是把这个对象挂在了这个pool对象的一个叫做chain的字段对应的chain上，以供下次从这个pool上分配ngx_chain_t类型对象的时候，快速的从这个pool->chain上取下链首元素就返回了，当然，如果这个链是空的，才会真的在这个pool上使用ngx_palloc函数进行分配。
 
 
 
 
-ngx_buf_t(99%) 
+ngx_buf_t(99%)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
@@ -894,36 +894,36 @@ ngx_buf_t(99%)
         u_char          *last;
         off_t            file_pos;
         off_t            file_last;
-    
+
         u_char          *start;         /* start of buffer */
         u_char          *end;           /* end of buffer */
         ngx_buf_tag_t    tag;
         ngx_file_t      *file;
         ngx_buf_t       *shadow;
-    
-    
+
+
         /* the buf's content could be changed */
         unsigned         temporary:1;
-    
+
         /*
          * the buf's content is in a memory cache or in a read only memory
          * and must not be changed
          */
         unsigned         memory:1;
-    
+
         /* the buf's content is mmap()ed and must not be changed */
         unsigned         mmap:1;
-    
+
         unsigned         recycled:1;
         unsigned         in_file:1;
         unsigned         flush:1;
         unsigned         sync:1;
         unsigned         last_buf:1;
         unsigned         last_in_chain:1;
-    
+
         unsigned         last_shadow:1;
         unsigned         temp_file:1;
-    
+
         /* STUB */ int   num;
     };
 
@@ -947,9 +947,9 @@ ngx_buf_t(99%)
 
 :temporary: 为1时表示该buf所包含的内容是在一个用户创建的内存块中，并且可以被在filter处理的过程中进行变更，而不会造成问题。
 
-:memory: 为1时表示该buf所包含的内容是在内存中，但是这些内容确不能被进行处理的filter进行变更。
+:memory: 为1时表示该buf所包含的内容是在内存中，但是这些内容却不能被进行处理的filter进行变更。
 
-:mmap: 为1时表示该buf所包含的内容是在内存中, 是通过mmap使用内存映射从文件中映射到内存中的，这些内容确不能被进行处理的filter进行变更。
+:mmap: 为1时表示该buf所包含的内容是在内存中, 是通过mmap使用内存映射从文件中映射到内存中的，这些内容却不能被进行处理的filter进行变更。
 
 :recycled: 可以回收的。也就是这个buf是可以被释放的。这个字段通常是配合shadow字段一起使用的，对于使用ngx_create_temp_buf 函数创建的buf，并且是另外一个buf的shadow，那么可以使用这个字段来标示这个buf是可以被释放的。
 
@@ -957,19 +957,15 @@ ngx_buf_t(99%)
 
 :flush: 遇到有flush字段被设置为1的的buf的chain，则该chain的数据即便不是最后结束的数据（last_buf被设置，标志所有要输出的内容都完了），也会进行输出，不会受postpone_output配置的限制，但是会受到发送速率等其他条件的限制。
 
-:sync:
+:sync: 为1时操作这块缓冲区使用同步方式。
 
 :last_buf: 数据被以多个chain传递给了过滤器，此字段为1表明这是最后一个buf。
 
 :last_in_chain: 在当前的chain里面，此buf是最后一个。特别要注意的是last_in_chain的buf不一定是last_buf，但是last_buf的buf一定是last_in_chain的。这是因为数据会被以多个chain传递给某个filter模块。
 
-:last_shadow:
- 在创建一个buf的shadow的时候，通常将新创建的一个buf的last_shadow置为1。 
+:last_shadow: 在创建一个buf的shadow的时候，通常将新创建的一个buf的last_shadow置为1。
 
-
-:temp_file:
- 由于受到内存使用的限制，有时候一些buf的内容需要被写到磁盘上的临时文件中去，那么这时，就设置此标志
- 。
+:temp_file: 由于受到内存使用的限制，有时候一些buf的内容需要被写到磁盘上的临时文件中去，那么这时，就设置此标志。
 
 
 对于此对象的创建，可以直接在某个ngx_pool_t上分配，然后根据需要，给对应的字段赋值。也可以使用定义好的2个宏：
@@ -989,7 +985,7 @@ ngx_buf_t(99%)
     ngx_buf_t *ngx_create_temp_buf(ngx_pool_t *pool, size_t size);
 
 
-该函数创建一个ngx_but_t类型的对象，并返回指向这个对象的指针，创建失败返回NULL。
+该函数创建一个ngx_buf_t类型的对象，并返回指向这个对象的指针，创建失败返回NULL。
 
 对于创建的这个对象，它的start和end指向新分配内存开始和结束的地方。pos和last都指向这块新分配内存的开始处，这样，后续的操作可以在这块新分配的内存上存入数据。
 
@@ -1041,7 +1037,7 @@ ngx_buf_t(99%)
 
 
 
-ngx_list_t(100%) 
+ngx_list_t(100%)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
@@ -1094,13 +1090,13 @@ ngx_list_t顾名思义，看起来好像是一个list的数据结构。这样的
 
     ngx_list_t *ngx_list_create(ngx_pool_t *pool, ngx_uint_t n, size_t size);
 
-该函数创建一个ngx_list_t类型的对象,并对该list的第一个节点分配存放元素的内存空间。
+该函数创建一个ngx_list_t类型的对象，并对该list的第一个节点分配存放元素的内存空间。
 
 :pool: 分配内存使用的pool。
 
-:n: 每个节点固定长度的数组的长度。
+:n: 每个节点（ngx_list_part_t）固定长度的数组的长度，即最多可以存放的元素个数。
 
-:size: 存放的具体元素的个数。
+:size: 每个元素所占用的内存大小。
 
 :返回值: 成功返回指向创建的ngx_list_t对象的指针，失败返回NULL。
 
@@ -1119,7 +1115,7 @@ ngx_list_t顾名思义，看起来好像是一个list的数据结构。这样的
 
 那么什么时候会出现已经有了ngx_list_t类型的对象，而其首节点存放元素的内存尚未分配的情况呢？那就是这个ngx_list_t类型的变量并不是通过调用ngx_list_create函数创建的。例如：如果某个结构体的一个成员变量是ngx_list_t类型的，那么当这个结构体类型的对象被创建出来的时候，这个成员变量也被创建出来了，但是它的首节点的存放元素的内存并未被分配。
 
-总之，如果这个ngx_list_t类型的变量，如果不是你通过调用函数ngx_list_create创建的，那么就必须调用此函数去初始话，否则，你往这个list里追加元素就可能引发不可预知的行为，亦或程序会崩溃!
+总之，如果这个ngx_list_t类型的变量，如果不是你通过调用函数ngx_list_create创建的，那么就必须调用此函数去初始化，否则，你往这个list里追加元素就可能引发不可预知的行为，亦或程序会崩溃!
 
 
 
@@ -1158,7 +1154,7 @@ ngx_queue_init()的宏定义如下：
 
     #define ngx_queue_init(q)     \
         (q)->prev = q;            \
-        (q)->next = q;
+        (q)->next = q
 
 可见初始的时候哨兵节点的 prev 和 next 都指向自己，因此其实是一个空链表。ngx_queue_empty()可以用来判断一个链表是否为空，其实现也很简单，就是：
 
@@ -1284,7 +1280,7 @@ nginx.conf中的配置信息，根据其逻辑上的意义，对它们进行了�
 当前nginx支持的几个指令上下文：
 
 :main: nginx在运行时与具体业务功能（比如http服务或者email服务代理）无关的一些参数，比如工作进程数，运行的身份等。
-:http: 与提供http服务相关的一些配置参数。例如：是否使用keepalive啊，是否使用gzip进行压缩等。
+:http: 与提供http服务相关的一些配置参数。例如：是否使用keepalive，是否使用gzip进行压缩等。
 :server: http服务上支持若干虚拟主机。每个虚拟主机一个对应的server配置项，配置项里面包含该虚拟主机相关的配置。在提供mail服务的代理时，也可以建立若干server.每个server通过监听的地址来区分。
 :location: http服务中，某些特定的URL对应的一系列配置项。
 :mail: 实现email相关的SMTP/IMAP/POP3代理时，共享的一些配置项（因为可能实现多个代理，工作在多个监听地址上）。
@@ -1303,33 +1299,33 @@ nginx.conf中的配置信息，根据其逻辑上的意义，对它们进行了�
         worker_connections  1024;
     }
 
-    http {  
-        server {  
-            listen          80;  
-            server_name     www.linuxidc.com;  
-            access_log      logs/linuxidc.access.log main;  
-            location / {  
-                index index.html;  
-                root  /var/www/linuxidc.com/htdocs;  
-            }  
-        }  
+    http {
+        server {
+            listen          80;
+            server_name     www.linuxidc.com;
+            access_log      logs/linuxidc.access.log main;
+            location / {
+                index index.html;
+                root  /var/www/linuxidc.com/htdocs;
+            }
+        }
 
-        server {  
-            listen          80;  
-            server_name     www.Androidj.com;  
-            access_log      logs/androidj.access.log main;  
-            location / {  
-                index index.html;  
-                root  /var/www/androidj.com/htdocs;  
-            }  
-        }  
+        server {
+            listen          80;
+            server_name     www.Androidj.com;
+            access_log      logs/androidj.access.log main;
+            location / {
+                index index.html;
+                root  /var/www/androidj.com/htdocs;
+            }
+        }
     }
-      
+
     mail {
         auth_http  127.0.0.1:80/auth.php;
         pop3_capabilities  "TOP"  "USER";
         imap_capabilities  "IMAP4rev1"  "UIDPLUS";
-       
+
         server {
             listen     110;
             protocol   pop3;
@@ -1413,7 +1409,7 @@ nginx的模块根据其功能基本上可以分为以下几种类型：
 
 :output filter: 也称为filter模块，主要是负责对输出的内容进行处理，可以对输出进行修改。例如，可以实现对输出的所有html页面增加预定义的footbar一类的工作，或者对输出的图片的URL进行替换之类的工作。
 
-:upstream: upstream模块实现反向代理的功能，将真正的请求转发到后端服务器上，并从后端服务器上读取响应，发回客户端。upstream模块是一种特殊的handler，只不过响应内容不是真正有自己产生的，而是从后端服务器上读取的。
+:upstream: upstream模块实现反向代理的功能，将真正的请求转发到后端服务器上，并从后端服务器上读取响应，发回客户端。upstream模块是一种特殊的handler，只不过响应内容不是真正由自己产生的，而是从后端服务器上读取的。
 
 :load-balancer: 负载均衡模块，实现特定的算法，在众多的后端服务器中，选择一个服务器出来作为某个请求的转发服务器。
 
@@ -1449,7 +1445,7 @@ worker进程中，ngx_worker_process_cycle()函数就是这个无限循环的处
 #) 初始化HTTP Request（读取来自客户端的数据，生成HTTP Request对象，该对象含有该请求所有的信息）。
 #) 处理请求头。
 #) 处理请求体。
-#) 如果有的话，调用与此请求（URL或者Location）关联的handler
+#) 如果有的话，调用与此请求（URL或者Location）关联的handler。
 #) 依次调用各phase handler进行处理。
 
 在这里，我们需要了解一下phase handler这个概念。phase字面的意思，就是阶段。所以phase handlers也就好理解了，就是包含若干个处理阶段的一些handler。
@@ -1462,8 +1458,8 @@ worker进程中，ngx_worker_process_cycle()函数就是这个无限循环的处
 
 #) 获取location配置。
 #) 产生适当的响应。
-#) 发送response header.
-#) 发送response body.
+#) 发送response header。
+#) 发送response body。
 
 
 当nginx读取到一个HTTP Request的header的时候，nginx首先查找与这个请求关联的虚拟主机的配置。如果找到了这个虚拟主机的配置，那么通常情况下，这个HTTP Request将会经过以下几个阶段的处理（phase handlers）：
@@ -1476,18 +1472,18 @@ worker进程中，ngx_worker_process_cycle()函数就是这个无限循环的处
 :NGX_HTTP_PREACCESS_PHASE:      访问权限检查准备阶段
 :NGX_HTTP_ACCESS_PHASE: 访问权限检查阶段
 :NGX_HTTP_POST_ACCESS_PHASE:    访问权限检查提交阶段
-:NGX_HTTP_TRY_FILES_PHASE:      配置项try_files处理阶段  
+:NGX_HTTP_TRY_FILES_PHASE:      配置项try_files处理阶段
 :NGX_HTTP_CONTENT_PHASE:        内容产生阶段
 :NGX_HTTP_LOG_PHASE:    日志模块处理阶段
 
 
-在内容产生阶段，为了给一个request产生正确的响应，nginx必须把这个request交给一个合适的content handler去处理。如果这个request对应的location在配置文件中被明确指定了一个content handler，那么nginx就可以通过对location的匹配，直接找到这个对应的handler，并把这个request交给这个content handler去处理。这样的配置指令包括像，perl，flv，proxy_pass，mp4等。
+在内容产生阶段，为了给一个request产生正确的响应，nginx必须把这个request交给一个合适的content handler去处理。如果这个request对应的location在配置文件中被明确指定了一个content handler，那么nginx就可以通过对location的匹配，直接找到这个对应的handler，并把这个request交给这个content handler去处理。这样的配置指令包括像perl，flv，proxy_pass，mp4等。
 
 如果一个request对应的location并没有直接有配置的content handler，那么nginx依次尝试:
 
-#) 如果一个location里面有配置  random_index  on，那么随机选择一个文件，发送给客户端。
-#) 如果一个location里面有配置 index指令，那么发送index指令指名的文件，给客户端。
-#) 如果一个location里面有配置 autoindex  on，那么就发送请求地址对应的服务端路径下的文件列表给客户端。
+#) 如果一个location里面有配置random_index on，那么随机选择一个文件，发送给客户端。
+#) 如果一个location里面有配置index指令，那么发送index指令指明的文件，给客户端。
+#) 如果一个location里面有配置autoindex on，那么就发送请求地址对应的服务端路径下的文件列表给客户端。
 #) 如果这个request对应的location上有设置gzip_static on，那么就查找是否有对应的.gz文件存在，有的话，就发送这个给客户端（客户端支持gzip的情况下）。
 #) 请求的URI如果对应一个静态文件，static module就发送静态文件的内容到客户端。
 

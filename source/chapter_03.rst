@@ -371,7 +371,7 @@ r是http请求。里面包含请求所有的信息，这里不详细说明了，
 handler模块的挂载
 -----------------------
 
-handler模块真正的处理函数通过两种方式挂载到处理过程中，一种方式就是按处理阶段挂载;另外一种挂载方式就是按需挂载。
+handler模块真正的处理函数通过两种方式挂载到处理过程中，一种方式就是按处理阶段挂载；另外一种挂载方式就是按需挂载。
 
 按处理阶段挂载
 ~~~~~~~~~~~~~~~~~~
@@ -401,7 +401,7 @@ handler模块真正的处理函数通过两种方式挂载到处理过程中，�
 - NGX_HTTP_TRY_FILES_PHASE
 
 
-所以其实真正是有6个phase你可以去挂载handler。
+所以其实真正是有7个phase你可以去挂载handler。
 
 挂载的代码如下（摘自hello module）:
 
@@ -610,9 +610,9 @@ handler的编写步骤
 	 
 		/* set the 'Content-type' header */
 		/*
-		r->headers_out.content_type_len = sizeof("text/html") - 1;
-		r->headers_out.content_type.len = sizeof("text/html") - 1;
-		r->headers_out.content_type.data = (u_char *)"text/html";*/
+		 *r->headers_out.content_type.len = sizeof("text/html") - 1;
+		 *r->headers_out.content_type.data = (u_char *)"text/html";
+                 */
 		ngx_str_set(&r->headers_out.content_type, "text/html");
 		
 	 
@@ -760,7 +760,7 @@ config文件的编写
 编译
 ~~~~~~~~~~~~~~~~~~
 
-对于模块的编译，nginx并不像apache一样，提供了单独的编译工具，可以在没有nginx源代码的情况下来单独编译一个模块的代码。nginx必须去到nginx的源代码目录里，通过configure指令的参数，来进行编译。下面看一下hello module的configure指令：
+对于模块的编译，nginx并不像apache一样，提供了单独的编译工具，可以在没有apache源代码的情况下来单独编译一个模块的代码。nginx必须去到nginx的源代码目录里，通过configure指令的参数，来进行编译。下面看一下hello module的configure指令：
         
 ./configure --prefix=/usr/local/nginx-1.3.1 --add-module=/home/jizhao/open_source/book_module
 
@@ -844,7 +844,7 @@ http static module的代码位于src/http/modules/ngx_http_static_module.c中，
 		NULL                                   /* merge location configuration */
 	};
 
-是非常的简洁吧，连任何与配置相关的函数都没有。对了，因为该模块没有提供任何配置指令。大家想想也就知道了，这个模块做的事情实在是太简单了，也确实没什么好配置的。唯一需要调用的函数是一个ngx_http_static_init函数。好了，来看一下这个函数都干了写什么。
+是非常的简洁吧，连任何与配置相关的函数都没有。对了，因为该模块没有提供任何配置指令。大家想想也就知道了，这个模块做的事情实在是太简单了，也确实没什么好配置的。唯一需要调用的函数是一个ngx_http_static_init函数。好了，来看一下这个函数都干了些什么。
 
 .. code:: c
 
@@ -1107,7 +1107,7 @@ http log module
 
 该模块提供了对于每一个http请求进行记录的功能，也就是我们见到的access.log。当然这个模块对于log提供了一些配置指令，使得可以比较方便的定制access.log。
 
-这个模块的代码位于src/http/modules/ngx_http_log_module.c，虽然这个模块的代码有接近1400行，但是主要的逻辑在于对日志本身格式啊，等细节的处理。我们在这里进行分析主要是关注，如何编写一个log handler的问题。
+这个模块的代码位于src/http/modules/ngx_http_log_module.c，虽然这个模块的代码有接近1400行，但是主要的逻辑在于对日志本身格式等细节的处理。我们在这里进行分析主要是关注，如何编写一个log handler的问题。
 
 由于log handler的时候，拿到的参数也是request这个东西，那么也就意味着我们如果需要，可以好好研究下这个结构，把我们需要的所有信息都记录下来。
 
